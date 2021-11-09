@@ -3,12 +3,15 @@ package dns
 // A client implementation.
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"strings"
 	"time"
 )
@@ -21,6 +24,8 @@ const (
 // A Conn represents a connection to a DNS server.
 type Conn struct {
 	net.Conn                         // a net.Conn holding the connection
+	Request        *http.Request     // a http.Request holding the request
+	Response       *http.Response    // a http.Response holding the response
 	UDPSize        uint16            // minimum receive buffer for UDP messages
 	TsigSecret     map[string]string // secret(s) for Tsig map[<zonename>]<base64 secret>, zonename must be in canonical form (lowercase, fqdn, see RFC 4034 Section 6.2)
 	TsigProvider   TsigProvider      // An implementation of the TsigProvider interface. If defined it replaces TsigSecret and is used for all TSIG operations.
@@ -102,9 +107,24 @@ func (c *Client) DialContext(ctx context.Context, address string) (conn *Conn, e
 	}
 
 	useTLS := strings.HasPrefix(network, "tcp") && strings.HasSuffix(network, "-tls")
+	useHTTPS := strings.HasPrefix(network, "https") || strings.HasPrefix(network, "doh")
 
 	conn = new(Conn)
-	if useTLS {
+	if useHTTPS {
+		method := http.MethodPost
+		if strings.HasSuffix(network, "-get") {
+			method = http.MethodGet
+		}
+		conn.Request, err = http.NewRequestWithContext(ctx, method, address, nil)
+		if err != nil {
+			return
+		}
+		conn.Request.Header.Set("Authority", conn.Request.Host)
+		conn.Request.Header.Set("Accept", "application/dns-message")
+		if conn.Request.Method == http.MethodPost {
+			conn.Request.Header.Set("Content-Type", "application/dns-message")
+		}
+	} else if useTLS {
 		network = strings.TrimSuffix(network, "-tls")
 
 		// TODO(miekg): Enable after Go 1.18 is released, to be able to support two prev. releases.
@@ -282,6 +302,19 @@ func (co *Conn) ReadMsgHeader(hdr *Header) ([]byte, error) {
 		err error
 	)
 
+	if co.Request != nil {
+		if co.Response == nil {
+			return nil, ErrShortRead
+		}
+		if co.Response.StatusCode >= http.StatusBadRequest {
+			return nil, &Error{http.StatusText(co.Response.StatusCode)}
+		}
+		b, err := io.ReadAll(co.Response.Body)
+		co.Response.Body.Close()
+		co.Response = nil
+		return b, err
+	}
+
 	if _, ok := co.Conn.(net.PacketConn); ok {
 		if co.UDPSize > MinMsgSize {
 			p = make([]byte, co.UDPSize)
@@ -361,6 +394,25 @@ func (co *Conn) WriteMsg(m *Msg) (err error) {
 	if err != nil {
 		return err
 	}
+
+	if co.Request != nil {
+		if co.Request.Method == http.MethodPost {
+			co.Request.ContentLength = int64(len(out))
+			co.Request.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(out)), nil
+			}
+		} else {
+			co.Request.URL.Query().Set("dns", base64.StdEncoding.EncodeToString(out))
+		}
+
+		res, err := http.DefaultClient.Do(co.Request)
+		if err != nil {
+			return err
+		}
+		co.Response = res
+		return nil
+	}
+
 	_, err = co.Write(out)
 	return err
 }
